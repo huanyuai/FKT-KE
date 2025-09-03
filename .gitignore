@@ -5,8 +5,20 @@ __pycache__/
 models/
 # 忽略 Python 缓存文件
 *.py[cod]
+*.pyc
 *$py.class
 __pycache__/
 *.so
 .Python
 build/
+utils/__pycache__/data.cpython-311.pyc
+utils/__pycache__/data.cpython-311.pyc
+editors/recipe/__pycache__/models.cpython-311.pyc
+editors/__pycache__/__init__.cpython-311.pyc
+editors/recipe/__pycache__/__init__.cpython-311.pyc
+editors/recipe/__pycache__/models.cpython-311.pyc
+editors/recipe/__pycache__/recipe.cpython-311.pyc
+utils/__pycache__/__init__.cpython-311.pyc
+utils/__pycache__/data.cpython-311.pyc
+utils/__pycache__/global_attrs.cpython-311.pyc
+utils/__pycache__/utils.cpython-311.pyc

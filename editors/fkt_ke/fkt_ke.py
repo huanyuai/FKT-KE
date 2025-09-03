@@ -164,7 +164,8 @@ class FKTKE(BaseEditor):
     @torch.no_grad()
     def _value_from_key(self, r_k: torch.Tensor) -> torch.Tensor:
         # 将键向量映射为连续提示向量 [T, H]
-        p = self.prompt_transformer.key_to_prompt(r_k.unsqueeze(0))  # [1, T, H]
+        # FIX: Changed from .key_to_prompt(..) to direct call, invoking the forward() method.
+        p = self.prompt_transformer(r_k.unsqueeze(0))  # [1, T, H]
         return p.squeeze(0)
 
     @torch.no_grad()
@@ -190,5 +191,4 @@ class FKTKE(BaseEditor):
         vals, idx = torch.topk(A, k=top_k)
         selected = [int(i) for v, i in zip(vals.tolist(), idx.tolist()) if v >= self.cfg.retr_min_score]
         return selected
-
 
