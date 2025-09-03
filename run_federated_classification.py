@@ -279,6 +279,8 @@ if __name__ == '__main__':
     parser.add_argument('--max_train_samples', type=int, default=1000, help="Total samples for creating Non-IID partitions.")
     parser.add_argument('--max_pub_samples', type=int, default=100)
     parser.add_argument('--max_test_samples', type=int, default=200)
+    parser.add_argument('--krm_ckpt_path', type=str, default=None, help='Path to pretrained KnowledgeRepModel ckpt')
+    parser.add_argument('--prompt_transformer_ckpt_path', type=str, default=None, help='Path to pretrained PromptTransformer ckpt')
     args = parser.parse_args()
 
     # --- 1a. 解析设备参数 ---
@@ -295,6 +297,11 @@ if __name__ == '__main__':
     print(f"Loading base model onto single device: {resolved_device} for LoRA training...")
     base_model = AutoModelForCausalLM.from_pretrained(model_path).to(resolved_device)
     config = FKTKEConfig.from_yaml(config_path)
+    # 覆盖可选的任务对齐权重路径（如果从命令行提供）
+    if args.krm_ckpt_path is not None:
+        config.krm_ckpt_path = args.krm_ckpt_path
+    if args.prompt_transformer_ckpt_path is not None:
+        config.prompt_transformer_ckpt_path = args.prompt_transformer_ckpt_path
 
     # --- 2. 初始化客户端 ---
     # --- 3. 加载并划分数据 ---

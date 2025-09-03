@@ -30,6 +30,9 @@ class FKTKEConfig(EditorConfig):
 
     # 组件路径
     krm_base_path: str = 'models/roberta-base'
+    # 新增字段：可选的预训练组件权重路径
+    krm_ckpt_path: Optional[str] = None
+    prompt_transformer_ckpt_path: Optional[str] = None
 
 
 class FKTKE(BaseEditor):
@@ -49,6 +52,10 @@ class FKTKE(BaseEditor):
             device=self.device,
             base_path=config.krm_base_path,
         )
+        # 可选加载任务对齐权重
+        if self.cfg.krm_ckpt_path:
+            self.knowl_rep_model.load_state_dict(torch.load(self.cfg.krm_ckpt_path, map_location=self.device))
+            print(f"Loaded task-aligned KnowledgeRepModel from {self.cfg.krm_ckpt_path}")
         for p in self.knowl_rep_model.parameters():
             p.requires_grad = False
 
@@ -58,6 +65,10 @@ class FKTKE(BaseEditor):
             config.prompt_token_n,
             self.device,
         )
+        # 可选加载任务对齐权重
+        if self.cfg.prompt_transformer_ckpt_path:
+            self.prompt_transformer.load_state_dict(torch.load(self.cfg.prompt_transformer_ckpt_path, map_location=self.device))
+            print(f"Loaded task-aligned PromptTransformer from {self.cfg.prompt_transformer_ckpt_path}")
         for p in self.prompt_transformer.parameters():
             p.requires_grad = False
 
