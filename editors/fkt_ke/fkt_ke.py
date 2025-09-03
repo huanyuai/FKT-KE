@@ -3,6 +3,7 @@ from typing import Dict, List, Tuple, Optional
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from editors.editor import BaseEditor, EditorConfig
@@ -114,36 +115,57 @@ class FKTKE(BaseEditor):
     @torch.no_grad()
     def generate_with_memory(self,
                              prompt_texts: List[str],
-                             max_new_tokens: int = 32,
-                             temperature: float = 0.8,
-                             top_p: float = 0.95,
-                             do_sample: bool = True) -> List[str]:
-        # 对每个输入，基于激活潜能选择 top-k 记忆，将对应提示前置拼接到 inputs_embeds
-        tok = self.tokenizer
+                             max_new_tokens: int = 5,
+                             do_sample: bool = False,
+                             **kwargs) -> List[str]:
+        
         res: List[str] = []
         for text in prompt_texts:
-            # 选择记忆（基于文本查询）
-            selected_idx = self._select_memory(text)
-            # 3) 构造 inputs_embeds（前置拼接）
-            inputs = tok(text, return_tensors='pt').to(self.device)
-            inputs_embeds = self.model.get_input_embeddings()(inputs['input_ids'])  # [1, L, H]
-            if len(selected_idx) > 0:
-                # 将所选记忆提示按序拼接（合并为 [1, T_sum, H]）
-                prompt_embeds = [self.memory_prompts[i].unsqueeze(0) for i in selected_idx]
-                prompt_embeds = torch.cat(prompt_embeds, dim=1)  # [1, T_sum, H]
-                inputs_embeds = torch.cat([prompt_embeds, inputs_embeds], dim=1)
-            # 4) 调用模型生成（仅返回新生成文本）
-            output_ids = self.model.generate(
-                inputs_embeds=inputs_embeds,
-                attention_mask=torch.ones(inputs_embeds.size()[:-1], dtype=torch.long, device=self.device),
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                do_sample=do_sample,
-                pad_token_id=tok.eos_token_id,
-            )
-            gen_only = output_ids[0][-max_new_tokens:]
-            res.append(tok.decode(gen_only, skip_special_tokens=True))
+            # --- 内部仲裁 ---
+            # 1. 获取 LoRA 模型直接预测的置信度
+            self.active_prompt = None
+            inputs = self.tokenizer(text, return_tensors='pt').to(self.device)
+            outputs = self.model(**inputs)
+            logits = outputs.logits[:, -1, :]
+            probs = F.softmax(logits, dim=-1)
+            lora_conf, _ = torch.max(probs, dim=-1)
+
+            # 2. 获取最佳记忆的得分
+            best_mem_idx, mem_score = self.calculate_activation_potential(text)
+            normalized_mem_score = mem_score / 10.0
+
+            # 3. 决策：是否激活记忆
+            use_memory = best_mem_idx != -1 and normalized_mem_score > lora_conf.item()
+
+            # --- 生成 ---
+            final_inputs = self.tokenizer(text, return_tensors='pt').to(self.device)
+            if use_memory:
+                # print(f"Arbitration: Using memory {best_mem_idx} (score: {mem_score:.2f}) over LoRA (conf: {lora_conf.item():.2f})")
+                prompt_embeds = self.memory_prompts[best_mem_idx].unsqueeze(0)
+                inputs_embeds = self.model.get_input_embeddings()(final_inputs['input_ids'])
+                merged_embeds = torch.cat([prompt_embeds, inputs_embeds], dim=1)
+                
+                output_ids = self.model.generate(
+                    inputs_embeds=merged_embeds,
+                    attention_mask=torch.ones(merged_embeds.size()[:-1], dtype=torch.long, device=self.device),
+                    max_new_tokens=max_new_tokens,
+                    do_sample=do_sample,
+                    pad_token_id=self.tokenizer.eos_token_id,
+                    **kwargs
+                )
+            else:
+                # print(f"Arbitration: Using LoRA model (conf: {lora_conf.item():.2f})")
+                output_ids = self.model.generate(
+                    **final_inputs,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=do_sample,
+                    pad_token_id=self.tokenizer.eos_token_id,
+                    **kwargs
+                )
+
+            input_len = final_inputs['input_ids'].shape[1]
+            gen_only_ids = output_ids[0][input_len:]
+            res.append(self.tokenizer.decode(gen_only_ids, skip_special_tokens=True))
         return res
 
     # --- 内部方法 ---

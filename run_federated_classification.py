@@ -128,21 +128,48 @@ class FKTKEClient:
 
     @torch.no_grad()
     def broadcast_prediction(self, prompt: str) -> Dict[str, Any]:
-        # 首先尝试用记忆库生成，这代表了客户端的“偏见”
-        outs = self.editor.generate_with_memory([prompt], max_new_tokens=5, do_sample=False)
-        pred_label = (outs[0].strip().split()[0]) if outs and outs[0].strip() else ""
+        """
+        执行内部仲裁，决定最终的预测和置信度。
+        """
+        editor = self.editor
+        tok = editor.tokenizer
         
-        # 为了广播，我们还需要一个置信度。这里简化一下：
-        # 如果是靠记忆生成的，置信度高；否则，靠原始模型。
-        # 一个更严谨的方法是获取生成token的概率，但当前generate接口不直接返回。
-        # 我们暂时用一个启发式方法。
-        best_idx, score = self.editor.calculate_activation_potential(prompt)
-        confidence = 0.5 + (score / 10.0) if best_idx != -1 else 0.5 # Heuristic confidence
+        # --- 顾问1：获取 LoRA 模型的直接预测 ---
+        # 确保不使用记忆库，直接调用原始模型
+        editor.active_prompt = None 
+        inputs = tok(prompt, return_tensors='pt').to(editor.device)
+        outputs = editor.model(**inputs)
+        logits = outputs.logits[:, -1, :]
+        probs = F.softmax(logits, dim=-1)
+        lora_conf, lora_pred_id = torch.max(probs, dim=-1)
+        lora_pred_label = tok.decode(lora_pred_id, skip_special_tokens=True).strip()
+        
+        # --- 顧問2：获取记忆库的建议 ---
+        best_mem_idx, mem_score = editor.calculate_activation_potential(prompt)
+        
+        # --- 仲裁决策 ---
+        # 我们需要一个标准来比较 lora_conf (0-1) 和 mem_score (无界)。
+        # 策略：如果记忆库中存在一个足够强的信号，并且该信号超过了LoRA模型自身的置信度，则采纳记忆。
+        # 这是一个启发式规则，可以进一步调优。
+        # 将 mem_score 归一化到一个可比较的范围，例如通过一个缩放因子。
+        normalized_mem_score = mem_score / 10.0 # 假设10分是一个很强的激活信号
+        
+        final_prediction = lora_pred_label
+        final_confidence = lora_conf.item()
 
+        if best_mem_idx != -1 and normalized_mem_score > lora_conf.item():
+            # 使用记忆生成
+            outs = editor.generate_with_memory([prompt], max_new_tokens=5, do_sample=False)
+            mem_pred_label = (outs[0].strip().split()[0]) if outs and outs[0].strip() else ""
+            
+            if mem_pred_label:
+                final_prediction = mem_pred_label
+                final_confidence = normalized_mem_score # 使用归一化的记忆分数作为置信度
+        
         return {
             'prompt': prompt,
-            'prediction': pred_label,
-            'confidence': confidence,
+            'prediction': final_prediction,
+            'confidence': final_confidence,
         }
 
 
