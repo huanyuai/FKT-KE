@@ -122,10 +122,8 @@ class FKTKE(BaseEditor):
         tok = self.tokenizer
         res: List[str] = []
         for text in prompt_texts:
-            # 1) 形成查询向量
-            r_q: torch.Tensor = self._encode_query(text)  # [D]
-            # 2) 选择记忆
-            selected_idx = self._select_memory(r_q)
+            # 选择记忆（基于文本查询）
+            selected_idx = self._select_memory(text)
             # 3) 构造 inputs_embeds（前置拼接）
             inputs = tok(text, return_tensors='pt').to(self.device)
             inputs_embeds = self.model.get_input_embeddings()(inputs['input_ids'])  # [1, L, H]
@@ -180,21 +178,38 @@ class FKTKE(BaseEditor):
         return self._encode_knowledge(text)
 
     @torch.no_grad()
-    def _select_memory(self, r_q: torch.Tensor) -> List[int]:
+    def calculate_activation_potential(self, query_text: str) -> Tuple[int, float]:
+        """
+        根据文本查询计算激活潜能，并返回最佳记忆的索引和得分。
+        """
         if len(self.memory_keys) == 0:
-            return []
-        # 计算激活潜能 A = λ_sim * cos + λ_E * S_E + λ_R * log(1 + S_R)
-        K = torch.stack(self.memory_keys, dim=0)  # [N, D]
-        # 归一化后余弦
+            return -1, -float('inf')
+
+        # 1) 形成查询向量
+        r_q: torch.Tensor = self._encode_query(query_text)
+
+        # 2) 计算激活潜能
+        K = torch.stack(self.memory_keys, dim=0)
         r_q_n = r_q / (r_q.norm(p=2) + 1e-8)
         K_n = K / (K.norm(dim=-1, keepdim=True) + 1e-8)
-        cos = (K_n @ r_q_n)  # [N]
+        cos = (K_n @ r_q_n)
         E = torch.tensor(self.memory_E, device=self.device, dtype=cos.dtype)
         R = torch.tensor(self.memory_R, device=self.device, dtype=cos.dtype)
         A = self.cfg.lambda_sim * cos + self.cfg.lambda_E * E + self.cfg.lambda_R * torch.log1p(R)
-        # 选择 top-k 且阈值过滤
-        top_k = min(self.cfg.retr_top_k, A.numel())
-        vals, idx = torch.topk(A, k=top_k)
-        selected = [int(i) for v, i in zip(vals.tolist(), idx.tolist()) if v >= self.cfg.retr_min_score]
-        return selected
+
+        # 3) 找到最佳者
+        best_score, best_idx = torch.max(A, dim=0)
+        return best_idx.item(), best_score.item()
+
+    @torch.no_grad()
+    def _select_memory(self, query_text: str) -> List[int]:
+        """
+        根据文本查询选择 top-k 的记忆索引。
+        """
+        if len(self.memory_keys) == 0:
+            return []
+        best_idx, best_score = self.calculate_activation_potential(query_text)
+        if best_score >= self.cfg.retr_min_score:
+            return [best_idx]
+        return []
 
