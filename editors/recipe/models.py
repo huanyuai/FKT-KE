@@ -11,6 +11,25 @@ class KnowledgeRepModel(nn.Module):
     def __init__(self, rep_n = 2048, prot_token_n = 10, device = 'cuda:0', 
                 base_path = 'models/roberta-base') -> None:
         super().__init__()
+        # 确保基础路径存在
+        import os
+        os.makedirs(base_path, exist_ok=True)
+        # print(f"path: {base_path}")
+        # 检查 Roberta 模型和 tokenizer 是否已下载
+        if not os.path.exists(os.path.join(base_path, "tokenizer.json")):
+            print(f"Downloading and saving roberta-base to {base_path}...")
+            # 从 Hugging Face 下载
+            temp_tokenizer = RobertaTokenizer.from_pretrained('roberta-base')
+            temp_model = RobertaModel.from_pretrained('roberta-base')
+            
+            # 保存到本地
+            temp_tokenizer.save_pretrained(base_path)
+            temp_model.save_pretrained(base_path)
+            print("Roberta model and tokenizer saved locally.")
+        else:
+            print(f"Loading Roberta model and tokenizer from local path: {base_path}")
+        
+        
         self.tokenizer = RobertaTokenizer.from_pretrained(base_path)
         self.base_model = RobertaModel.from_pretrained(base_path)
         self.knowl_trans_mlp1 = nn.Linear(4 * 768, rep_n, True)

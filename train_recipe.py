@@ -8,6 +8,22 @@ import os
 
 def train_recipe(model_name:str, data_name, device, load_ckpt_path):
     model_path, config_path = get_model_editor_config_path(model_name, 'recipe')
+    # Ensure the model directory exists
+    os.makedirs(model_path, exist_ok=True)
+    
+    # Download and save model/tokenizer if not already present locally
+    if not os.path.exists(os.path.join(model_path, "tokenizer.json")):  # Check for a tokenizer file
+        print(f"Downloading and saving {model_name} to {model_path}...")
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        model = AutoModelForCausalLM.from_pretrained(model_name)
+        
+        tokenizer.save_pretrained(model_path)
+        model.save_pretrained(model_path)
+        print("Model and tokenizer saved locally.")
+    else:
+        print(f"Loading model and tokenizer from local path: {model_path}")
+        
+        
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     model = AutoModelForCausalLM.from_pretrained(model_path, device_map = device) 
     config = RECIPEConfig.from_yaml(config_path)

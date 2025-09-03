@@ -1,0 +1,12 @@
+# 忽略大文件夹
+train_records/
+tmp/
+__pycache__/
+models/
+# 忽略 Python 缓存文件
+*.py[cod]
+*$py.class
+__pycache__/
+*.so
+.Python
+build/
