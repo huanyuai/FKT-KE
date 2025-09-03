@@ -1,0 +1,17 @@
+edit_model_name: "gpt2-xl"
+begin_layer_path: "transformer.h.0"
+lm_head_path: "lm_head"
+model_hidden_size: 1600
+
+# 记忆/检索与提示
+knowledge_rep_dim: 4096
+knowl_rep_prot_token_n: 10
+prompt_token_n: 3
+lambda_sim: 1.0
+lambda_E: 0.5
+lambda_R: 0.5
+retr_top_k: 1
+retr_min_score: -999.0
+krm_base_path: "models/roberta-base"
+
+

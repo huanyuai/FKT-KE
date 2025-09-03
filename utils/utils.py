@@ -50,6 +50,10 @@ def get_editor(editor_name:str, edit_model_name:str, device:int, editor_ckpt_pat
         editor = RECIPE(model, tokenizer, config, device, model_path_map['roberta-base'])
         if editor_ckpt_path != None:
             editor.load_ckpt(editor_ckpt_path, True, False)
+    elif editor_name == 'fkt-ke':
+        from editors.fkt_ke import FKTKE, FKTKEConfig
+        config = FKTKEConfig.from_yaml(config_path)
+        editor = FKTKE(model, tokenizer, config, device)
     else:
         raise
     if device == 'auto':
