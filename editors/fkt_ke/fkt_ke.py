@@ -81,10 +81,10 @@ class FKTKE(BaseEditor):
         # request 需包含：{'prompt': str, 'target_new': str, 'E': float, 'R': float}
         self.edit_batch([request])
 
-    def edit_batch(self, requests: List[Dict]):
+    def edit_batch(self, requests: List[Dict], metadatas: Optional[List[Dict]] = None):
         # 批量写入记忆痕迹
         # 必要字段：prompt/knowledge_text/target_new -> 作为知识句子编码
-        for req in requests:
+        for idx, req in enumerate(requests):
             # 构造知识文本（可按需要更精细，这里用 prompt + target_new）
             knowl_text = req.get('knowledge_text', None)
             if knowl_text is None:
@@ -95,8 +95,13 @@ class FKTKE(BaseEditor):
                 p_k: torch.Tensor = self._value_from_key(r_k)            # [T, H]
             self.memory_keys.append(r_k.detach().to(self.device))
             self.memory_prompts.append(p_k.detach().to(self.device))
-            self.memory_E.append(float(req.get('E', 1.0)))
-            self.memory_R.append(float(req.get('R', 0.0)))
+            if metadatas is not None and idx < len(metadatas) and metadatas[idx] is not None:
+                meta = metadatas[idx]
+                self.memory_E.append(float(meta.get('E', 1.0)))
+                self.memory_R.append(float(meta.get('R', 0.0)))
+            else:
+                self.memory_E.append(float(req.get('E', 1.0)))
+                self.memory_R.append(float(req.get('R', 0.0)))
 
     def restore_to_original_model(self):
         # FKT-KE 不修改权重，只需清空记忆或关闭注入
@@ -129,7 +134,7 @@ class FKTKE(BaseEditor):
                 prompt_embeds = [self.memory_prompts[i].unsqueeze(0) for i in selected_idx]
                 prompt_embeds = torch.cat(prompt_embeds, dim=1)  # [1, T_sum, H]
                 inputs_embeds = torch.cat([prompt_embeds, inputs_embeds], dim=1)
-            # 4) 调用模型生成
+            # 4) 调用模型生成（仅返回新生成文本）
             output_ids = self.model.generate(
                 inputs_embeds=inputs_embeds,
                 attention_mask=torch.ones(inputs_embeds.size()[:-1], dtype=torch.long, device=self.device),
@@ -139,7 +144,8 @@ class FKTKE(BaseEditor):
                 do_sample=do_sample,
                 pad_token_id=tok.eos_token_id,
             )
-            res.append(tok.decode(output_ids[0], skip_special_tokens=True))
+            gen_only = output_ids[0][-max_new_tokens:]
+            res.append(tok.decode(gen_only, skip_special_tokens=True))
         return res
 
     # --- 内部方法 ---
