@@ -27,6 +27,8 @@ class FKTKEConfig(EditorConfig):
     lambda_R: float
     retr_top_k: int = 1
     retr_min_score: float = -999.0
+    # 新增字段
+    confidence_threshold: float = 0.7  # 本地模型的自信阈值
 
     # 组件路径
     krm_base_path: str = 'models/roberta-base'
@@ -128,30 +130,36 @@ class FKTKE(BaseEditor):
                              prompt_texts: List[str],
                              max_new_tokens: int = 5,
                              do_sample: bool = False,
+                             arbitration_override: bool = False, # 新增参数
                              **kwargs) -> List[str]:
         
         res: List[str] = []
         for text in prompt_texts:
             # --- 内部仲裁 ---
-            # 1. 获取 LoRA 模型直接预测的置信度
-            self.active_prompt = None
-            inputs = self.tokenizer(text, return_tensors='pt').to(self.device)
-            outputs = self.model(**inputs)
-            logits = outputs.logits[:, -1, :]
-            probs = F.softmax(logits, dim=-1)
-            lora_conf, _ = torch.max(probs, dim=-1)
+            use_memory = False
+            if arbitration_override:
+                # 在 broadcast_prediction 中，如果需要记忆，则强制使用
+                best_mem_idx, _ = self.calculate_activation_potential(text)
+                if best_mem_idx != -1:
+                    use_memory = True
+            else:
+                # 正常评测流程，执行专家否决仲裁
+                self.active_prompt = None
+                inputs = self.tokenizer(text, return_tensors='pt').to(self.device)
+                outputs = self.model(**inputs)
+                logits = outputs.logits[:, -1, :]
+                probs = F.softmax(logits, dim=-1)
+                lora_conf, _ = torch.max(probs, dim=-1)
 
-            # 2. 获取最佳记忆的得分
-            best_mem_idx, mem_score = self.calculate_activation_potential(text)
-            normalized_mem_score = mem_score / 10.0
-
-            # 3. 决策：是否激活记忆
-            use_memory = best_mem_idx != -1 and normalized_mem_score > lora_conf.item()
+                if lora_conf.item() < self.cfg.confidence_threshold:
+                    best_mem_idx, _ = self.calculate_activation_potential(text)
+                    if best_mem_idx != -1:
+                        use_memory = True
 
             # --- 生成 ---
             final_inputs = self.tokenizer(text, return_tensors='pt').to(self.device)
             if use_memory:
-                # print(f"Arbitration: Using memory {best_mem_idx} (score: {mem_score:.2f}) over LoRA (conf: {lora_conf.item():.2f})")
+                best_mem_idx, _ = self.calculate_activation_potential(text) # 再次获取以确保索引正确
                 prompt_embeds = self.memory_prompts[best_mem_idx].unsqueeze(0)
                 inputs_embeds = self.model.get_input_embeddings()(final_inputs['input_ids'])
                 merged_embeds = torch.cat([prompt_embeds, inputs_embeds], dim=1)
@@ -165,7 +173,6 @@ class FKTKE(BaseEditor):
                     **kwargs
                 )
             else:
-                # print(f"Arbitration: Using LoRA model (conf: {lora_conf.item():.2f})")
                 output_ids = self.model.generate(
                     **final_inputs,
                     max_new_tokens=max_new_tokens,
