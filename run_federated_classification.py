@@ -77,7 +77,8 @@ def train_client_lora(client_id, base_model, tokenizer, private_data, device='cu
     prompts = [s['prompt'] for s in private_data]
     full_texts = [f"{s['prompt']} {s['label']}" for s in private_data]
     
-    prompt_enc = tokenizer(prompts, padding=False, truncation=True, return_tensors='pt')
+    # 对 prompt 与完整文本使用一致的填充/截断策略
+    prompt_enc = tokenizer(prompts, padding=True, truncation=True, max_length=256, return_tensors='pt')
     full_enc = tokenizer(full_texts, padding=True, truncation=True, max_length=256, return_tensors='pt')
 
     input_ids = full_enc['input_ids']
@@ -85,8 +86,10 @@ def train_client_lora(client_id, base_model, tokenizer, private_data, device='cu
     labels = input_ids.clone()
 
     # 关键：实现损失掩码，只计算标签部分的损失
+    # 使用 attention_mask 统计每个 prompt 的真实长度
+    prompt_lens = prompt_enc['attention_mask'].sum(dim=1)
     for i in range(len(labels)):
-        prompt_len = len(prompt_enc['input_ids'][i])
+        prompt_len = int(prompt_lens[i].item())
         labels[i, :prompt_len] = -100 # 将 prompt 部分的标签设为 -100，PyTorch会自动忽略
 
     # 4) 训练逻辑
