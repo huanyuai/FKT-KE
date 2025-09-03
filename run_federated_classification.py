@@ -265,7 +265,8 @@ if __name__ == '__main__':
     model_path, config_path = get_model_editor_config_path(args.edit_model_name, 'fkt-ke')
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
-    base_model = AutoModelForCausalLM.from_pretrained(model_path, device_map=args.device)
+    print(f"Loading base model onto single device: {resolved_device} for LoRA training...")
+    base_model = AutoModelForCausalLM.from_pretrained(model_path).to(resolved_device)
     config = FKTKEConfig.from_yaml(config_path)
 
     # --- 2. 初始化客户端 ---
