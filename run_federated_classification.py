@@ -54,8 +54,8 @@ def create_non_iid_partitions(dataset: List[Dict[str, Any]], num_clients: int) -
     return client_partitions
 
 
-def train_client_lora(client_id, base_model, tokenizer, private_data, device='cuda'):
-    """为某个客户端在其私有数据上进行简化的 LoRA 微调，返回 LoRA 模型。"""
+def train_client_lora(client_id, base_model, tokenizer, private_data, device='cuda', epochs=3, batch_size=4, lr=1e-4):
+    """为某个客户端在其私有数据上进行优化的 LoRA 微调，返回 LoRA 模型。"""
     # 1) 配置 LoRA
     lora_config = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
@@ -70,27 +70,35 @@ def train_client_lora(client_id, base_model, tokenizer, private_data, device='cu
     lora_model.print_trainable_parameters()
     lora_model.to(device)
 
-    # 3) 数据格式化
+    # 3) 数据格式化与损失掩码
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
-    texts = [f"{s['prompt']} {s['label']}" for s in private_data]
-    enc = tokenizer(texts, return_tensors='pt', padding=True, truncation=True, max_length=256)
-    input_ids = enc['input_ids']
-    attention_mask = enc['attention_mask']
-    labels = input_ids.clone()
-    labels[attention_mask == 0] = -100
+    
+    prompts = [s['prompt'] for s in private_data]
+    full_texts = [f"{s['prompt']} {s['label']}" for s in private_data]
+    
+    prompt_enc = tokenizer(prompts, padding=False, truncation=True, return_tensors='pt')
+    full_enc = tokenizer(full_texts, padding=True, truncation=True, max_length=256, return_tensors='pt')
 
-    # 4) 训练逻辑（精简版）
+    input_ids = full_enc['input_ids']
+    attention_mask = full_enc['attention_mask']
+    labels = input_ids.clone()
+
+    # 关键：实现损失掩码，只计算标签部分的损失
+    for i in range(len(labels)):
+        prompt_len = len(prompt_enc['input_ids'][i])
+        labels[i, :prompt_len] = -100 # 将 prompt 部分的标签设为 -100，PyTorch会自动忽略
+
+    # 4) 训练逻辑
     from torch.optim import AdamW
-    optimizer = AdamW(lora_model.parameters(), lr=1e-4)
+    optimizer = AdamW(lora_model.parameters(), lr=lr)
     lora_model.train()
 
-    epochs = 1
-    batch_size = 8
     num_samples = input_ids.size(0)
-    num_steps = (num_samples + batch_size - 1) // batch_size
+    num_steps_per_epoch = (num_samples + batch_size - 1) // batch_size
+    
     for epoch in range(epochs):
-        pbar = tqdm(range(num_steps), desc=f"Client {client_id} LoRA Epoch {epoch+1}")
+        pbar = tqdm(range(num_steps_per_epoch), desc=f"Client {client_id} LoRA Epoch {epoch+1}/{epochs}")
         for step in pbar:
             start = step * batch_size
             end = min(start + batch_size, num_samples)
@@ -279,6 +287,7 @@ if __name__ == '__main__':
     parser.add_argument('--max_test_samples', type=int, default=200)
     parser.add_argument('--krm_ckpt_path', type=str, default=None, help='Path to pretrained KnowledgeRepModel ckpt')
     parser.add_argument('--prompt_transformer_ckpt_path', type=str, default=None, help='Path to pretrained PromptTransformer ckpt')
+    parser.add_argument('--lora_epochs', type=int, default=3, help="Number of epochs for LoRA fine-tuning.")
     args = parser.parse_args()
 
     # --- 1a. 解析设备参数 ---
@@ -310,7 +319,7 @@ if __name__ == '__main__':
     clients: List[FKTKEClient] = []
     for cid in range(args.num_clients):
         print(f"--- Training LoRA for Client {cid} ---")
-        lora_model = train_client_lora(cid, base_model, tokenizer, client_private_data[cid], resolved_device)
+        lora_model = train_client_lora(cid, base_model, tokenizer, client_private_data[cid], resolved_device, epochs=args.lora_epochs)
         editor = FKTKE(lora_model, tokenizer, config, resolved_device)
         clients.append(FKTKEClient(cid, editor))
 

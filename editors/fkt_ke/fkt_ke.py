@@ -164,9 +164,17 @@ class FKTKE(BaseEditor):
                 inputs_embeds = self.model.get_input_embeddings()(final_inputs['input_ids'])
                 merged_embeds = torch.cat([prompt_embeds, inputs_embeds], dim=1)
                 
+                # 更新 attention_mask 以包含提示
+                mask_to_add = torch.ones(
+                    (merged_embeds.size(0), prompt_embeds.size(1)),
+                    device=self.device,
+                    dtype=final_inputs['attention_mask'].dtype
+                )
+                new_attention_mask = torch.cat([mask_to_add, final_inputs['attention_mask']], dim=1)
+
                 output_ids = self.model.generate(
                     inputs_embeds=merged_embeds,
-                    attention_mask=torch.ones(merged_embeds.size()[:-1], dtype=torch.long, device=self.device),
+                    attention_mask=new_attention_mask,
                     max_new_tokens=max_new_tokens,
                     do_sample=do_sample,
                     pad_token_id=self.tokenizer.eos_token_id,
