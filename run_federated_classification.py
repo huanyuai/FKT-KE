@@ -254,6 +254,13 @@ if __name__ == '__main__':
     parser.add_argument('--max_test_samples', type=int, default=200)
     args = parser.parse_args()
 
+    # --- 1a. 解析设备参数 ---
+    if args.device == 'auto':
+        resolved_device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    else:
+        resolved_device = args.device
+    print(f"Resolved device for training and operations: {resolved_device}")
+
     # --- 1. 加载共享模型与配置 ---
     model_path, config_path = get_model_editor_config_path(args.edit_model_name, 'fkt-ke')
     tokenizer = AutoTokenizer.from_pretrained(model_path)
@@ -270,8 +277,8 @@ if __name__ == '__main__':
     clients: List[FKTKEClient] = []
     for cid in range(args.num_clients):
         print(f"--- Training LoRA for Client {cid} ---")
-        lora_model = train_client_lora(cid, base_model, tokenizer, client_private_data[cid], args.device)
-        editor = FKTKE(lora_model, tokenizer, config, args.device)
+        lora_model = train_client_lora(cid, base_model, tokenizer, client_private_data[cid], resolved_device)
+        editor = FKTKE(lora_model, tokenizer, config, resolved_device)
         clients.append(FKTKEClient(cid, editor))
 
     public_data = load_and_format_agnews('train', args.max_pub_samples) # 公共数据可以是独立的或训练集的一部分
