@@ -14,6 +14,7 @@ import config
 from client import Client
 from utils.data_utils import create_non_iid_partitions
 from torch.utils.tensorboard import SummaryWriter
+from utils.eval_utils import compute_classification_metrics, run_and_log_confidence
 
 
 def _parse_args() -> argparse.Namespace:
@@ -24,6 +25,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--editor_ckpt_path", type=str, default=None, help="Pretrained editor checkpoint path")
     parser.add_argument("--log_dir", type=str, default="runs", help="Root directory for TensorBoard logs")
     parser.add_argument("--alpha", type=float, default=config.NONIID_ALPHA, help="Dirichlet alpha for non-IID split")
+    parser.add_argument("--enable_eval", action="store_true", help="Enable local eval and confidence logging")
     return parser.parse_args()
 
 
@@ -65,46 +67,72 @@ class TBLossCallback(TrainerCallback):
 
 
 def _compute_classification_metrics(predictions: np.ndarray, labels: np.ndarray) -> Dict[str, float]:
-    # predictions may be logits or probabilities
-    if predictions.ndim == 2 and predictions.shape[1] > 1:
-        y_pred = predictions.argmax(axis=1)
+    return compute_classification_metrics(predictions, labels)
+
+
+def _softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:
+    x = x - np.max(x, axis=axis, keepdims=True)
+    e = np.exp(x)
+    return e / (np.sum(e, axis=axis, keepdims=True) + 1e-12)
+
+
+def _log_confidence_metrics(
+    writer: SummaryWriter,
+    tag_prefix: str,
+    logits: np.ndarray,
+    labels: np.ndarray,
+    num_bins: int = 10,
+    global_step: int | None = None,
+) -> None:
+    # Convert logits to probabilities and confidences
+    if logits.ndim == 1:
+        probs = 1.0 / (1.0 + np.exp(-logits))
+        probs = np.stack([1 - probs, probs], axis=1)
+    elif logits.ndim == 2 and logits.shape[1] == 1:
+        probs = 1.0 / (1.0 + np.exp(-logits[:, 0]))
+        probs = np.stack([1 - probs, probs], axis=1)
     else:
-        # binary single-logit case: threshold at 0
-        y_pred = (predictions.ravel() > 0).astype(int)
+        probs = _softmax(logits, axis=1)
 
+    confidences = probs.max(axis=1)
+    preds = probs.argmax(axis=1)
     y_true = labels.astype(int)
-    assert y_true.shape[0] == y_pred.shape[0]
 
-    num_classes = int(max(y_true.max(initial=0), y_pred.max(initial=0)) + 1)
-    # Accuracy
-    accuracy = float((y_true == y_pred).mean())
+    # Overall
+    overall_acc = float((preds == y_true).mean())
+    mean_conf = float(confidences.mean())
+    writer.add_scalar(f"{tag_prefix}/confidence/overall_accuracy", overall_acc, global_step or 0)
+    writer.add_scalar(f"{tag_prefix}/confidence/mean_confidence", mean_conf, global_step or 0)
+    writer.add_histogram(f"{tag_prefix}/confidence/hist", confidences, global_step or 0)
 
-    # Per-class metrics
-    recalls = []
-    precisions = []
-    f1s = []
-    eps = 1e-12
-    for c in range(num_classes):
-        tp = float(np.sum((y_true == c) & (y_pred == c)))
-        fp = float(np.sum((y_true != c) & (y_pred == c)))
-        fn = float(np.sum((y_true == c) & (y_pred != c)))
-        prec_c = tp / (tp + fp + eps)
-        rec_c = tp / (tp + fn + eps)
-        f1_c = 2 * prec_c * rec_c / (prec_c + rec_c + eps)
-        precisions.append(prec_c)
-        recalls.append(rec_c)
-        f1s.append(f1_c)
+    # Reliability diagram bins and Expected Calibration Error (ECE)
+    edges = np.linspace(0.0, 1.0, num_bins + 1)
+    ece = 0.0
+    n = len(confidences)
+    for i in range(num_bins):
+        left = edges[i]
+        right = edges[i + 1]
+        if i == 0:
+            mask = (confidences >= left) & (confidences <= right)
+        else:
+            mask = (confidences > left) & (confidences <= right)
+        if not np.any(mask):
+            continue
+        bin_conf = float(confidences[mask].mean())
+        bin_acc = float((preds[mask] == y_true[mask]).mean())
+        frac = float(mask.mean())
+        ece += frac * abs(bin_acc - bin_conf)
+        # Log per-bin scalars as a group
+        writer.add_scalars(
+            f"{tag_prefix}/confidence/reliability/bin_{i}",
+            {"acc": bin_acc, "conf": bin_conf, "frac": frac},
+            global_step or 0,
+        )
 
-    recall_macro = float(np.mean(recalls))
-    f1_macro = float(np.mean(f1s))
-    return {
-        "accuracy": accuracy,
-        "f1_macro": f1_macro,
-        "recall_macro": recall_macro,
-    }
+    writer.add_scalar(f"{tag_prefix}/confidence/ECE", float(ece), global_step or 0)
 
 
-def _finetune_client_with_lora(client: Client, output_dir: str, writer: SummaryWriter) -> None:
+def _finetune_client_with_lora(client: Client, output_dir: str, writer: SummaryWriter, enable_eval: bool) -> None:
     # Wrap the client's model with a LoRA adapter
     lora_cfg = _build_lora_config()
     peft_model = get_peft_model(client.model, lora_cfg)
@@ -120,7 +148,7 @@ def _finetune_client_with_lora(client: Client, output_dir: str, writer: SummaryW
         max_steps=config.TRAINING_DEFAULTS["max_steps"],
         gradient_accumulation_steps=config.TRAINING_DEFAULTS["gradient_accumulation_steps"],
         save_strategy="no",
-        evaluation_strategy="steps",
+        evaluation_strategy="steps" if enable_eval else "no",
         eval_steps=config.TRAINING_DEFAULTS["logging_steps"],
         report_to=[],
         remove_unused_columns=False,
@@ -141,14 +169,24 @@ def _finetune_client_with_lora(client: Client, output_dir: str, writer: SummaryW
         model=peft_model,
         args=training_args,
         train_dataset=train_ds,
-        eval_dataset=eval_ds,
+        eval_dataset=eval_ds if enable_eval else None,
         data_collator=collator,
-        compute_metrics=compute_metrics_fn,
+        compute_metrics=compute_metrics_fn if enable_eval else None,
     )
 
     # Attach TB loss logging
     trainer.add_callback(TBLossCallback(writer, tag_prefix=f"client_{client.client_id}"))
     trainer.train()
+
+    # Confidence analysis on local eval set (only when enabled)
+    if enable_eval:
+        run_and_log_confidence(
+            trainer=trainer,
+            eval_dataset=eval_ds,
+            writer=writer,
+            tag_prefix=f"client_{client.client_id}",
+            num_bins=10,
+        )
 
     # Merge LoRA weights back to the base model for later use in FL
     merged = peft_model.merge_and_unload()
@@ -219,7 +257,12 @@ def main() -> None:
     for client in clients:
         output_dir = os.path.join("./outputs", f"client_{client.client_id}_lora")
         os.makedirs(output_dir, exist_ok=True)
-        _finetune_client_with_lora(client, output_dir=output_dir, writer=client_writers[client.client_id])
+        _finetune_client_with_lora(
+            client,
+            output_dir=output_dir,
+            writer=client_writers[client.client_id],
+            enable_eval=args.enable_eval,
+        )
 
     print("[Info] LoRA fine-tuning completed for all clients. Ready for FL rounds.")
 
