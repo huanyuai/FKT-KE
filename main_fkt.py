@@ -5,8 +5,9 @@ import os
 from typing import List, Optional, Dict, Any
 
 import torch
+import numpy as np
 from datasets import load_dataset, Dataset
-from transformers import AutoTokenizer, TrainingArguments, Trainer, DataCollatorWithPadding
+from transformers import AutoTokenizer, TrainingArguments, Trainer, DataCollatorWithPadding, TrainerCallback
 from peft import LoraConfig, TaskType, get_peft_model
 
 import config
@@ -48,7 +49,7 @@ def _build_lora_config() -> LoraConfig:
     )
 
 
-class TBLossCallback:
+class TBLossCallback(TrainerCallback):
     def __init__(self, writer: SummaryWriter, tag_prefix: str) -> None:
         self.writer = writer
         self.tag_prefix = tag_prefix
