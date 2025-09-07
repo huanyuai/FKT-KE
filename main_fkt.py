@@ -58,9 +58,50 @@ class TBLossCallback(TrainerCallback):
     def on_log(self, args, state, control, logs=None, **kwargs):
         if logs is None:
             return
-        if "loss" in logs:
-            self._global_step = state.global_step
-            self.writer.add_scalar(f"{self.tag_prefix}/train_loss", float(logs["loss"]), self._global_step)
+        self._global_step = state.global_step
+        for key, value in logs.items():
+            if isinstance(value, (int, float)):
+                self.writer.add_scalar(f"{self.tag_prefix}/{key}", float(value), self._global_step)
+
+
+def _compute_classification_metrics(predictions: np.ndarray, labels: np.ndarray) -> Dict[str, float]:
+    # predictions may be logits or probabilities
+    if predictions.ndim == 2 and predictions.shape[1] > 1:
+        y_pred = predictions.argmax(axis=1)
+    else:
+        # binary single-logit case: threshold at 0
+        y_pred = (predictions.ravel() > 0).astype(int)
+
+    y_true = labels.astype(int)
+    assert y_true.shape[0] == y_pred.shape[0]
+
+    num_classes = int(max(y_true.max(initial=0), y_pred.max(initial=0)) + 1)
+    # Accuracy
+    accuracy = float((y_true == y_pred).mean())
+
+    # Per-class metrics
+    recalls = []
+    precisions = []
+    f1s = []
+    eps = 1e-12
+    for c in range(num_classes):
+        tp = float(np.sum((y_true == c) & (y_pred == c)))
+        fp = float(np.sum((y_true != c) & (y_pred == c)))
+        fn = float(np.sum((y_true == c) & (y_pred != c)))
+        prec_c = tp / (tp + fp + eps)
+        rec_c = tp / (tp + fn + eps)
+        f1_c = 2 * prec_c * rec_c / (prec_c + rec_c + eps)
+        precisions.append(prec_c)
+        recalls.append(rec_c)
+        f1s.append(f1_c)
+
+    recall_macro = float(np.mean(recalls))
+    f1_macro = float(np.mean(f1s))
+    return {
+        "accuracy": accuracy,
+        "f1_macro": f1_macro,
+        "recall_macro": recall_macro,
+    }
 
 
 def _finetune_client_with_lora(client: Client, output_dir: str, writer: SummaryWriter) -> None:
@@ -79,15 +120,30 @@ def _finetune_client_with_lora(client: Client, output_dir: str, writer: SummaryW
         max_steps=config.TRAINING_DEFAULTS["max_steps"],
         gradient_accumulation_steps=config.TRAINING_DEFAULTS["gradient_accumulation_steps"],
         save_strategy="no",
+        evaluation_strategy="steps",
+        eval_steps=config.TRAINING_DEFAULTS["logging_steps"],
         report_to=[],
         remove_unused_columns=False,
     )
+    # Split client's private dataset into train/eval
+    split = client.private_data.train_test_split(test_size=0.1, seed=config.SEED)
+    train_ds = split["train"]
+    eval_ds = split["test"]
+
+    def compute_metrics_fn(eval_pred):
+        preds, labels = eval_pred
+        # Some HF versions provide tuple(preds, None)
+        if isinstance(preds, (tuple, list)):
+            preds = preds[0]
+        return _compute_classification_metrics(preds, labels)
 
     trainer = Trainer(
         model=peft_model,
         args=training_args,
-        train_dataset=client.private_data,
+        train_dataset=train_ds,
+        eval_dataset=eval_ds,
         data_collator=collator,
+        compute_metrics=compute_metrics_fn,
     )
 
     # Attach TB loss logging

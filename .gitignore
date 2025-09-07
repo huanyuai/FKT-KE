@@ -10,3 +10,13 @@ __pycache__/
 *.so
 .Python
 build/
+
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Python 3.11 specific
+__pycache__/__init__.cpython-311.pyc
+__pycache__/*.cpython-311.pyc
