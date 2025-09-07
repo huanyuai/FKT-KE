@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import json
 from typing import List, Optional, Dict, Any
 
 import torch
@@ -9,6 +10,7 @@ import numpy as np
 from datasets import load_dataset, Dataset
 from transformers import AutoTokenizer, TrainingArguments, Trainer, DataCollatorWithPadding, TrainerCallback
 from peft import LoraConfig, TaskType, get_peft_model
+from datetime import datetime
 
 import config
 from client import Client
@@ -234,10 +236,31 @@ def main() -> None:
     print(f"[Info] Creating non-IID partitions: K={args.num_clients}, alpha={args.alpha}")
     private_datasets, public_dataset = create_non_iid_partitions(tokenized, args.num_clients, args.alpha)
 
-    # TensorBoard writers
-    os.makedirs(args.log_dir, exist_ok=True)
-    writer_global = SummaryWriter(log_dir=os.path.join(args.log_dir, "global"))
-    client_writers = [SummaryWriter(log_dir=os.path.join(args.log_dir, f"client_{i}")) for i in range(args.num_clients)]
+    # Run-specific logging directory (unique per run)
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    run_name = f"{ts}_ds-{args.dataset_name}_K{args.num_clients}_a{args.alpha}_eval{int(args.enable_eval)}"
+    run_dir = os.path.join(args.log_dir, run_name)
+    os.makedirs(run_dir, exist_ok=True)
+
+    # TensorBoard writers under run_dir
+    writer_global = SummaryWriter(log_dir=os.path.join(run_dir, "global"))
+    client_writers = [SummaryWriter(log_dir=os.path.join(run_dir, f"client_{i}")) for i in range(args.num_clients)]
+
+    # Log hyperparameters to file and TensorBoard
+    hparams: Dict[str, Any] = {
+        "dataset_name": args.dataset_name,
+        "num_clients": args.num_clients,
+        "num_rounds": args.num_rounds,
+        "alpha": args.alpha,
+        "enable_eval": args.enable_eval,
+        "seed": config.SEED,
+        "model_name": config.MODEL_NAME,
+        "lora_config": config.LORA_CONFIG,
+        "training_defaults": config.TRAINING_DEFAULTS,
+    }
+    with open(os.path.join(run_dir, "hparams.json"), "w", encoding="utf-8") as f:
+        json.dump(hparams, f, ensure_ascii=False, indent=2)
+    writer_global.add_text("hparams", json.dumps(hparams, ensure_ascii=False, indent=2), global_step=0)
 
     # Visualize label distribution per client
     print("[Info] Logging client label distributions to TensorBoard")
@@ -255,7 +278,7 @@ def main() -> None:
 
     # Pre-FL per-client LoRA warm-up
     for client in clients:
-        output_dir = os.path.join("./outputs", f"client_{client.client_id}_lora")
+        output_dir = os.path.join(run_dir, "outputs", f"client_{client.client_id}_lora")
         os.makedirs(output_dir, exist_ok=True)
         _finetune_client_with_lora(
             client,
