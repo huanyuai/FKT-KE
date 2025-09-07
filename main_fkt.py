@@ -232,6 +232,11 @@ def main() -> None:
     tokenized = base_train.map(tok_fn, batched=True, remove_columns=[c for c in base_train.column_names if c not in ["text", "label", "labels"]])
     tokenized.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
 
+    # Infer number of labels for the classification head
+    labels_all = tokenized["labels"].numpy() if hasattr(tokenized["labels"], "numpy") else np.array(tokenized["labels"])
+    unique_labels = np.unique(labels_all)
+    num_labels = int(unique_labels.max() + 1) if unique_labels.min() >= 0 and unique_labels.max() + 1 == len(unique_labels) else int(len(unique_labels))
+
     # Build non-IID partitions
     print(f"[Info] Creating non-IID partitions: K={args.num_clients}, alpha={args.alpha}")
     private_datasets, public_dataset = create_non_iid_partitions(tokenized, args.num_clients, args.alpha)
@@ -274,7 +279,13 @@ def main() -> None:
     # Initialize clients
     clients: List[Client] = []
     for client_id in range(args.num_clients):
-        clients.append(Client(client_id=client_id, private_dataset=private_datasets[client_id], device=device, tokenizer=tokenizer))
+        clients.append(Client(
+            client_id=client_id,
+            private_dataset=private_datasets[client_id],
+            device=device,
+            tokenizer=tokenizer,
+            num_labels=num_labels,
+        ))
 
     # Pre-FL per-client LoRA warm-up
     for client in clients:

@@ -25,16 +25,18 @@ class Client:
         private_dataset: Dataset,
         device: torch.device,
         tokenizer: PreTrainedTokenizerBase,
+        num_labels: int = 2,
     ) -> None:
         self.client_id: int = client_id
         self.device: torch.device = device
         self.tokenizer: PreTrainedTokenizerBase = tokenizer
+        self.num_labels: int = int(num_labels)
 
         # Load base model per config
         # Default to binary classification; callers may later resize as needed
         self.model = AutoModelForSequenceClassification.from_pretrained(
             config.MODEL_NAME,
-            num_labels=2,
+            num_labels=self.num_labels,
         )
         self.model.to(self.device)
 
