@@ -17,6 +17,7 @@ from client import Client
 from utils.data_utils import create_non_iid_partitions
 from torch.utils.tensorboard import SummaryWriter
 from utils.eval_utils import compute_classification_metrics, run_and_log_confidence
+from torch.utils.data import WeightedRandomSampler
 
 
 def _parse_args() -> argparse.Namespace:
@@ -152,6 +153,9 @@ def _finetune_client_with_lora(client: Client, output_dir: str, writer: SummaryW
         save_strategy="no",
         evaluation_strategy="steps" if enable_eval else "no",
         eval_steps=config.TRAINING_DEFAULTS["logging_steps"],
+        weight_decay=config.TRAINING_DEFAULTS.get("weight_decay", 0.0),
+        warmup_ratio=config.TRAINING_DEFAULTS.get("warmup_ratio", 0.0),
+        label_smoothing_factor=config.TRAINING_DEFAULTS.get("label_smoothing_factor", 0.0),
         report_to=[],
         remove_unused_columns=False,
     )
@@ -167,6 +171,16 @@ def _finetune_client_with_lora(client: Client, output_dir: str, writer: SummaryW
             preds = preds[0]
         return _compute_classification_metrics(preds, labels)
 
+    # Build class-balanced sampler for training
+    labels_np = np.array(train_ds["labels"]) if "labels" in train_ds.column_names else None
+    train_sampler = None
+    if labels_np is not None and labels_np.size > 0:
+        unique_labs, counts = np.unique(labels_np, return_counts=True)
+        # inverse frequency as weight
+        freq = {int(l): float(c) for l, c in zip(unique_labs, counts)}
+        weights = np.array([1.0 / (freq[int(l)] + 1e-12) for l in labels_np], dtype=np.float64)
+        train_sampler = WeightedRandomSampler(weights=weights, num_samples=len(weights), replacement=True)
+
     trainer = Trainer(
         model=peft_model,
         args=training_args,
@@ -174,7 +188,19 @@ def _finetune_client_with_lora(client: Client, output_dir: str, writer: SummaryW
         eval_dataset=eval_ds if enable_eval else None,
         data_collator=collator,
         compute_metrics=compute_metrics_fn if enable_eval else None,
+        # pass sampler via data_collator is not supported; override get_train_dataloader instead
     )
+
+    if train_sampler is not None:
+        def _get_train_dataloader_override():
+            from torch.utils.data import DataLoader
+            return DataLoader(
+                train_ds,
+                batch_size=training_args.per_device_train_batch_size,
+                sampler=train_sampler,
+                collate_fn=collator,
+            )
+        trainer.get_train_dataloader = _get_train_dataloader_override
 
     # Attach TB loss logging
     trainer.add_callback(TBLossCallback(writer, tag_prefix=f"client_{client.client_id}"))
@@ -189,6 +215,9 @@ def _finetune_client_with_lora(client: Client, output_dir: str, writer: SummaryW
             tag_prefix=f"client_{client.client_id}",
             num_bins=10,
         )
+
+        # Optional: Evaluate on global public dataset to avoid local skew
+        # Note: `public_dataset` is not directly accessible here; compute in main and pass if needed.
 
     # Merge LoRA weights back to the base model for later use in FL
     merged = peft_model.merge_and_unload()
@@ -297,6 +326,34 @@ def main() -> None:
             writer=client_writers[client.client_id],
             enable_eval=args.enable_eval,
         )
+
+    if args.enable_eval:
+        # Evaluate each client model on the shared public dataset (balanced/global view)
+        # Build eval dataset for public split using same tokenizer format (already tokenized earlier pipeline; need to map)
+        def _public_tok_fn(batch: Dict[str, Any]) -> Dict[str, Any]:
+            text_col = "text"
+            if text_col not in batch:
+                for c in ["sentence", "content", "news", "review", "text"]:
+                    if c in batch:
+                        text_col = c
+                        break
+            toks = tokenizer(batch[text_col], truncation=True, max_length=256)
+            if "labels" in batch:
+                toks["labels"] = batch["labels"]
+            elif "label" in batch:
+                toks["labels"] = batch["label"]
+            return toks
+
+        public_tk = public_dataset.map(_public_tok_fn, batched=True, remove_columns=[c for c in public_dataset.column_names if c not in ["text", "label", "labels"]])
+        public_tk.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
+
+        for client in clients:
+            # temporary trainer to reuse eval loop on public set
+            tmp_args = TrainingArguments(output_dir=os.path.join(run_dir, "tmp_public_eval"), per_device_eval_batch_size=config.TRAINING_DEFAULTS["per_device_train_batch_size"], report_to=[], remove_unused_columns=False)
+            tmp_trainer = Trainer(model=client.model, args=tmp_args, data_collator=DataCollatorWithPadding(tokenizer=tokenizer))
+            pred = tmp_trainer.predict(public_tk)
+            metrics = compute_classification_metrics(pred.predictions if not isinstance(pred.predictions, (list, tuple)) else pred.predictions[0], pred.label_ids)
+            writer_global.add_scalars(f"public_eval/client_{client.client_id}", metrics, global_step=0)
 
     print("[Info] LoRA fine-tuning completed for all clients. Ready for FL rounds.")
 

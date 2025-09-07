@@ -28,12 +28,16 @@ LORA_CONFIG: Dict[str, Any] = {
 # Light training defaults for the quick client warm-up (before FL rounds)
 TRAINING_DEFAULTS: Dict[str, Any] = {
     "per_device_train_batch_size": 8,
-    "learning_rate": 5e-5,
+    "learning_rate": 2e-5,
     "num_train_epochs": 1,
-    "logging_steps": 1,
-    # Use max_steps to bound time regardless of dataset size
-    "max_steps": 30,
-    "gradient_accumulation_steps": 1,
+    "logging_steps": 50,
+    # Increase training budget for better convergence
+    "max_steps": 500,
+    "gradient_accumulation_steps": 4,
+    "weight_decay": 0.01,
+    "warmup_ratio": 0.1,
+    "label_smoothing_factor": 0.1,
+    
 }
 
 
