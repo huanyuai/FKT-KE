@@ -10,7 +10,7 @@ from typing import Dict, Any
 
 # Base model to use across clients. Must be compatible with
 # transformers.AutoModelForSequenceClassification
-MODEL_NAME: str = "roberta-base"
+MODEL_NAME: str = "bert-base-uncased"
 
 
 # Default LoRA settings for client-side quick adaptation
@@ -30,10 +30,19 @@ TRAINING_DEFAULTS: Dict[str, Any] = {
     "per_device_train_batch_size": 8,
     "learning_rate": 5e-5,
     "num_train_epochs": 1,
-    "logging_steps": 10,
+    "logging_steps": 1,
     # Use max_steps to bound time regardless of dataset size
-    "max_steps": 20,
+    "max_steps": 30,
     "gradient_accumulation_steps": 1,
 }
+
+
+# Reproducibility
+SEED: int = 42
+
+
+# Non-IID partition hyper-parameter (Dirichlet concentration)
+NONIID_ALPHA: float = 0.5
+
 
 

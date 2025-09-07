@@ -2,31 +2,27 @@ from __future__ import annotations
 
 import argparse
 import os
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 
 import torch
-from datasets import Dataset
+from datasets import load_dataset, Dataset
 from transformers import AutoTokenizer, TrainingArguments, Trainer, DataCollatorWithPadding
 from peft import LoraConfig, TaskType, get_peft_model
 
 import config
 from client import Client
+from utils.data_utils import create_non_iid_partitions
+from torch.utils.tensorboard import SummaryWriter
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="FKT-KE Federated Orchestration")
+    parser.add_argument("--dataset_name", type=str, default="imdb", help="HF dataset name, e.g., 'imdb' or 'ag_news'")
     parser.add_argument("--num_clients", "-K", type=int, default=5, help="Total number of clients")
-    parser.add_argument("--num_rounds", "-R", type=int, default=20, help="Total federated rounds")
-    parser.add_argument("--public_data_path", type=str, default=None, help="Path to public shared dataset")
-    parser.add_argument(
-        "--private_data_dir",
-        type=str,
-        default=None,
-        help="Directory containing per-client private data (e.g., client_0.json or client_0/)",
-    )
-    parser.add_argument(
-        "--editor_ckpt_path", type=str, default=None, help="Checkpoint path for the pretrained knowledge editor"
-    )
+    parser.add_argument("--num_rounds", type=int, default=20, help="Total federated rounds")
+    parser.add_argument("--editor_ckpt_path", type=str, default=None, help="Pretrained editor checkpoint path")
+    parser.add_argument("--log_dir", type=str, default="runs", help="Root directory for TensorBoard logs")
+    parser.add_argument("--alpha", type=float, default=config.NONIID_ALPHA, help="Dirichlet alpha for non-IID split")
     return parser.parse_args()
 
 
@@ -42,24 +38,6 @@ def _task_type_from_string(name: Optional[str]) -> TaskType:
     return mapping.get(name_up, TaskType.SEQ_CLS)
 
 
-def _resolve_client_private_path(base_dir: Optional[str], client_id: int) -> Optional[str]:
-    if base_dir is None:
-        return None
-    candidates = [
-        os.path.join(base_dir, f"client_{client_id}"),
-        os.path.join(base_dir, f"client_{client_id}.json"),
-        os.path.join(base_dir, f"client_{client_id}.jsonl"),
-        os.path.join(base_dir, str(client_id)),
-        os.path.join(base_dir, f"{client_id}.json"),
-        os.path.join(base_dir, f"{client_id}.jsonl"),
-    ]
-    for path in candidates:
-        if os.path.exists(path):
-            return path
-    # If none exists, return the base dir itself letting client fallback to synthetic data
-    return base_dir
-
-
 def _build_lora_config() -> LoraConfig:
     return LoraConfig(
         r=int(config.LORA_CONFIG.get("r", 8)),
@@ -70,7 +48,21 @@ def _build_lora_config() -> LoraConfig:
     )
 
 
-def _finetune_client_with_lora(client: Client, output_dir: str) -> None:
+class TBLossCallback:
+    def __init__(self, writer: SummaryWriter, tag_prefix: str) -> None:
+        self.writer = writer
+        self.tag_prefix = tag_prefix
+        self._global_step = 0
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if logs is None:
+            return
+        if "loss" in logs:
+            self._global_step = state.global_step
+            self.writer.add_scalar(f"{self.tag_prefix}/train_loss", float(logs["loss"]), self._global_step)
+
+
+def _finetune_client_with_lora(client: Client, output_dir: str, writer: SummaryWriter) -> None:
     # Wrap the client's model with a LoRA adapter
     lora_cfg = _build_lora_config()
     peft_model = get_peft_model(client.model, lora_cfg)
@@ -97,6 +89,8 @@ def _finetune_client_with_lora(client: Client, output_dir: str) -> None:
         data_collator=collator,
     )
 
+    # Attach TB loss logging
+    trainer.add_callback(TBLossCallback(writer, tag_prefix=f"client_{client.client_id}"))
     trainer.train()
 
     # Merge LoRA weights back to the base model for later use in FL
@@ -110,17 +104,65 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     tokenizer = AutoTokenizer.from_pretrained(config.MODEL_NAME, use_fast=True)
 
+    # Load dataset
+    print(f"[Info] Loading dataset: {args.dataset_name}")
+    raw = load_dataset(args.dataset_name)
+    # Use train split for client private data; keep a small public portion inside partitioner
+    base_train: Dataset = raw["train"] if "train" in raw else list(raw.values())[0]
+
+    # Normalize labels field name to 'labels' for Trainer and tokenization convenience
+    label_col = "label" if "label" in base_train.column_names else ("labels" if "labels" in base_train.column_names else None)
+    if label_col is None:
+        raise ValueError("Dataset must contain a label or labels column.")
+
+    # Tokenization function
+    def tok_fn(batch: Dict[str, Any]) -> Dict[str, Any]:
+        text_col = "text"
+        if text_col not in batch:
+            # Try common names
+            for c in ["sentence", "content", "news", "review", "text"]:
+                if c in batch:
+                    text_col = c
+                    break
+        toks = tokenizer(batch[text_col], truncation=True, max_length=256)
+        # ensure labels field name for Trainer
+        if "labels" in batch:
+            toks["labels"] = batch["labels"]
+        elif "label" in batch:
+            toks["labels"] = batch["label"]
+        return toks
+
+    tokenized = base_train.map(tok_fn, batched=True, remove_columns=[c for c in base_train.column_names if c not in ["text", "label", "labels"]])
+    tokenized.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
+
+    # Build non-IID partitions
+    print(f"[Info] Creating non-IID partitions: K={args.num_clients}, alpha={args.alpha}")
+    private_datasets, public_dataset = create_non_iid_partitions(tokenized, args.num_clients, args.alpha)
+
+    # TensorBoard writers
+    os.makedirs(args.log_dir, exist_ok=True)
+    writer_global = SummaryWriter(log_dir=os.path.join(args.log_dir, "global"))
+    client_writers = [SummaryWriter(log_dir=os.path.join(args.log_dir, f"client_{i}")) for i in range(args.num_clients)]
+
+    # Visualize label distribution per client
+    print("[Info] Logging client label distributions to TensorBoard")
+    for cid, ds in enumerate(private_datasets):
+        labels = ds["labels"].numpy() if hasattr(ds["labels"], "numpy") else np.array(ds["labels"])
+        # Use a histogram scalar counts per label
+        unique, counts = np.unique(labels, return_counts=True)
+        hist_text = ", ".join([f"{int(u)}:{int(c)}" for u, c in zip(unique, counts)])
+        client_writers[cid].add_text("label_distribution", hist_text, global_step=0)
+
     # Initialize clients
     clients: List[Client] = []
     for client_id in range(args.num_clients):
-        private_path = _resolve_client_private_path(args.private_data_dir, client_id)
-        clients.append(Client(client_id=client_id, private_data_path=private_path, device=device, tokenizer=tokenizer))
+        clients.append(Client(client_id=client_id, private_dataset=private_datasets[client_id], device=device, tokenizer=tokenizer))
 
     # Pre-FL per-client LoRA warm-up
     for client in clients:
         output_dir = os.path.join("./outputs", f"client_{client.client_id}_lora")
         os.makedirs(output_dir, exist_ok=True)
-        _finetune_client_with_lora(client, output_dir=output_dir)
+        _finetune_client_with_lora(client, output_dir=output_dir, writer=client_writers[client.client_id])
 
     print("[Info] LoRA fine-tuning completed for all clients. Ready for FL rounds.")
 
