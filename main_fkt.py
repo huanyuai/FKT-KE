@@ -3,12 +3,12 @@ from __future__ import annotations
 import argparse
 import os
 import json
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 
 import torch
 import numpy as np
 from datasets import load_dataset, Dataset
-from transformers import AutoTokenizer, TrainingArguments, Trainer, DataCollatorWithPadding, TrainerCallback
+from transformers import AutoTokenizer, TrainingArguments, Trainer, DataCollatorWithPadding, TrainerCallback, AutoModelForCausalLM
 from peft import LoraConfig, TaskType, get_peft_model
 from datetime import datetime
 
@@ -18,6 +18,9 @@ from utils.data_utils import create_non_iid_partitions
 from torch.utils.tensorboard import SummaryWriter
 from utils.eval_utils import compute_classification_metrics, run_and_log_confidence
 from torch.utils.data import WeightedRandomSampler
+from editors.recipe.recipe import RECIPEConfig
+from fkt_editor import FKTEditor
+from torch.utils.data import DataLoader
 
 
 def _parse_args() -> argparse.Namespace:
@@ -136,6 +139,39 @@ def _log_confidence_metrics(
     writer.add_scalar(f"{tag_prefix}/confidence/ECE", float(ece), global_step or 0)
 
 
+def _build_min_recipe_cfg(hidden: int = 768) -> RECIPEConfig:
+    return RECIPEConfig(
+        prompt_token_n=4,
+        edit_model_name="gpt2",
+        knowledge_rep_dim=256,
+        knowl_rep_prot_token_n=1,
+        model_hidden_size=hidden,
+        begin_layer_path="transformer.h.0.attn",
+        lm_head_path="lm_head",
+        training=RECIPEConfig.TrainingConfig(
+            krm_lr=1e-4,
+            pt_lr=1e-4,
+            relia_lambda=1.0,
+            gen_lambda=1.0,
+            loc_lambda=1.0,
+            contra_lambda=1.0,
+            query_knowledge_t=1.0,
+            query_prototype_t=1.0,
+            constra_hinge_scale=1.0,
+            edit_hinge_scale=1.0,
+        ),
+    )
+
+
+def _init_editor(device: torch.device) -> FKTEditor:
+    lm_tok = AutoTokenizer.from_pretrained("gpt2")
+    if lm_tok.pad_token_id is None:
+        lm_tok.pad_token = lm_tok.eos_token
+    lm = AutoModelForCausalLM.from_pretrained("gpt2").to(device)
+    cfg = _build_min_recipe_cfg(hidden=lm.config.n_embd)
+    return FKTEditor(model=lm, tokenizer=lm_tok, config=cfg, device=str(device), ckpt_path=None)
+
+
 def _finetune_client_with_lora(client: Client, output_dir: str, writer: SummaryWriter, enable_eval: bool, use_weighted_sampler: bool) -> None:
     # Wrap the client's model with a LoRA adapter
     lora_cfg = _build_lora_config()
@@ -223,6 +259,52 @@ def _finetune_client_with_lora(client: Client, output_dir: str, writer: SummaryW
     # Merge LoRA weights back to the base model for later use in FL
     merged = peft_model.merge_and_unload()
     client.model = merged.to(client.device)
+
+
+@torch.no_grad()
+def _predict_labels_and_confidences(model: torch.nn.Module, batch: Dict[str, torch.Tensor]) -> Dict[str, Any]:
+    logits = model(input_ids=batch["input_ids"].to(model.device), attention_mask=batch.get("attention_mask").to(model.device)).logits
+    probs = torch.softmax(logits, dim=-1)
+    confs, preds = torch.max(probs, dim=-1)
+    return {"preds": preds.cpu().numpy(), "confs": confs.cpu().numpy(), "logits": logits.cpu().numpy()}
+
+
+def _format_markdown_table(sample_texts: List[str], client_results: Dict[int, List[Tuple[int, float]]]) -> str:
+    # Header
+    headers = ["sample"] + [f"client_{cid}" for cid in sorted(client_results.keys())]
+    md = "| " + " | ".join(headers) + " |\n"
+    md += "|" + "|".join(["---"] * len(headers)) + "|\n"
+    # Rows
+    num_rows = len(sample_texts)
+    for i in range(num_rows):
+        row = [sample_texts[i][:80].replace("|", "/")]  # truncate to 80 chars
+        for cid in sorted(client_results.keys()):
+            lab, cf = client_results[cid][i]
+            row.append(f"{lab} ({cf:.2f})")
+        md += "| " + " | ".join(row) + " |\n"
+    return md
+
+
+def _evaluate_client(client: Client, eval_ds: Dataset, writer: SummaryWriter, round_idx: int) -> float:
+    client.model.eval()
+    collator = DataCollatorWithPadding(tokenizer=client.tokenizer)
+    dl = DataLoader(eval_ds, batch_size=client.model.config.to_dict().get("per_device_eval_batch_size", 32), shuffle=False, collate_fn=collator)
+    correct = 0
+    total = 0
+    for batch in dl:
+        # Decode texts for activation (if editor provided)
+        if getattr(client, 'editor', None) is not None:
+            texts = client.tokenizer.batch_decode(batch["input_ids"], skip_special_tokens=True)
+            prompts = client.editor.dynamic_activation(texts)
+            client.editor.adopted_prompts = [p.to(client.editor.device) for p in prompts]  # for hooked LMs
+        out = client.model(input_ids=batch["input_ids"].to(client.device), attention_mask=batch.get("attention_mask").to(client.device))
+        preds = out.logits.argmax(dim=-1).cpu()
+        labels = batch["labels"].cpu()
+        correct += int((preds == labels).sum().item())
+        total += int(labels.numel())
+    acc = (correct / max(1, total))
+    writer.add_scalar(f"client_{client.client_id}/accuracy", float(acc), round_idx)
+    return float(acc)
 
 
 def main() -> None:
@@ -359,9 +441,99 @@ def main() -> None:
 
     print("[Info] LoRA fine-tuning completed for all clients. Ready for FL rounds.")
 
-    # Placeholder for the main federated learning loop
-    # for round_idx in range(args.num_rounds):
-    #     ...
+    # ------------------------- Federated Rounds ------------------------- #
+    # Prepare a tokenized public set for batching (reuse public_tk if created; otherwise, build from tokenized train slices)
+    public_pool = private_datasets[0]  # use format-compatible dataset; we'll sample indices from public_dataset later
+    collator = DataCollatorWithPadding(tokenizer=tokenizer)
+    eval_base: Optional[Dataset] = None
+    if "test" in raw:
+        base_test: Dataset = raw["test"]
+        def tok_fn_eval(batch: Dict[str, Any]) -> Dict[str, Any]:
+            text_col = "text"
+            if text_col not in batch:
+                for c in ["sentence", "content", "news", "review", "text"]:
+                    if c in batch:
+                        text_col = c
+                        break
+            toks = tokenizer(batch[text_col], truncation=True, max_length=256)
+            if "labels" in batch:
+                toks["labels"] = batch["labels"]
+            elif "label" in batch:
+                toks["labels"] = batch["label"]
+            return toks
+        eval_base = base_test.map(tok_fn_eval, batched=True, remove_columns=[c for c in base_test.column_names if c not in ["text", "label", "labels"]])
+        eval_base.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
+
+    # Initialize editors for clients
+    editors: List[FKTEditor] = []
+    for c in clients:
+        ed = _init_editor(device)
+        c.editor = ed
+        editors.append(ed)
+
+    for round_idx in range(args.num_rounds):
+        print(f"[Round {round_idx}] Phase 1: inference on public batch")
+        # Sample a small batch from public_dataset indices
+        pub_size = len(public_dataset)
+        if pub_size == 0:
+            print("[Warn] Empty public dataset; skipping round.")
+            continue
+        batch_size = min(32, pub_size)
+        sel = np.random.choice(pub_size, size=batch_size, replace=False)
+        batch = public_dataset.select(sel)
+        # Build tensors
+        dl = DataLoader(batch, batch_size=batch_size, shuffle=False, collate_fn=collator)
+        batch_tensors = next(iter(dl))
+        # Decode sample texts for logging / conflict keys
+        sample_texts = tokenizer.batch_decode(batch_tensors["input_ids"], skip_special_tokens=True)
+
+        # Collect predictions per client
+        all_predictions: Dict[int, List[Tuple[int, float]]] = {}
+        for client in clients:
+            preds = _predict_labels_and_confidences(client.model, batch_tensors)
+            client_results = list(zip(preds["preds"].tolist(), preds["confs"].tolist()))
+            all_predictions[client.client_id] = client_results
+
+        # Log markdown table
+        md = _format_markdown_table(sample_texts, all_predictions)
+        writer_global.add_text(f"round_{round_idx}/public_predictions", md, global_step=round_idx)
+
+        # Phase 2 & 3: conflict detection and ingestion
+        print(f"[Round {round_idx}] Phase 2&3: conflict detection and ingestion")
+        for receiver in clients:
+            conflicts: Dict[Tuple[str, str], List[float]] = {}
+            recv_res = all_predictions[receiver.client_id]
+            for i, s_text in enumerate(sample_texts):
+                y_k = recv_res[i][0]
+                for other in clients:
+                    if other.client_id == receiver.client_id:
+                        continue
+                    y_j, conf_j = all_predictions[other.client_id][i]
+                    if int(y_j) != int(y_k):
+                        key = (s_text, str(y_j))
+                        conflicts.setdefault(key, []).append(float(conf_j))
+
+            # Build candidates list
+            candidates = []
+            for (sample, label_text), conf_list in conflicts.items():
+                candidates.append({
+                    "sample": sample,
+                    "label": label_text,
+                    "confidence": float(np.mean(conf_list)),
+                    "resonance": float(len(conf_list)),
+                })
+            if len(candidates) > 0:
+                editors[receiver.client_id].ingest_knowledge(candidates)
+            client_writers[receiver.client_id].add_scalar(
+                f"client_{receiver.client_id}/new_knowledge_count", len(candidates), round_idx
+            )
+
+        # Phase 4: evaluation
+        print(f"[Round {round_idx}] Phase 4: evaluation")
+        eval_ds = eval_base if eval_base is not None else public_dataset
+        for client in clients:
+            acc = _evaluate_client(client, eval_ds, client_writers[client.client_id], round_idx)
+            print(f"  Client {client.client_id} accuracy: {acc:.4f}")
 
 
 if __name__ == "__main__":
