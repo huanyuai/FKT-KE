@@ -29,6 +29,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--log_dir", type=str, default="runs", help="Root directory for TensorBoard logs")
     parser.add_argument("--alpha", type=float, default=config.NONIID_ALPHA, help="Dirichlet alpha for non-IID split")
     parser.add_argument("--enable_eval", action="store_true", help="Enable local eval and confidence logging")
+    parser.add_argument("--use_weighted_sampler", action="store_true", help="Use class-balanced WeightedRandomSampler during training")
     return parser.parse_args()
 
 
@@ -135,7 +136,7 @@ def _log_confidence_metrics(
     writer.add_scalar(f"{tag_prefix}/confidence/ECE", float(ece), global_step or 0)
 
 
-def _finetune_client_with_lora(client: Client, output_dir: str, writer: SummaryWriter, enable_eval: bool) -> None:
+def _finetune_client_with_lora(client: Client, output_dir: str, writer: SummaryWriter, enable_eval: bool, use_weighted_sampler: bool) -> None:
     # Wrap the client's model with a LoRA adapter
     lora_cfg = _build_lora_config()
     peft_model = get_peft_model(client.model, lora_cfg)
@@ -174,7 +175,7 @@ def _finetune_client_with_lora(client: Client, output_dir: str, writer: SummaryW
     # Build class-balanced sampler for training
     labels_np = np.array(train_ds["labels"]) if "labels" in train_ds.column_names else None
     train_sampler = None
-    if labels_np is not None and labels_np.size > 0:
+    if use_weighted_sampler and labels_np is not None and labels_np.size > 0:
         unique_labs, counts = np.unique(labels_np, return_counts=True)
         # inverse frequency as weight
         freq = {int(l): float(c) for l, c in zip(unique_labs, counts)}
@@ -325,6 +326,7 @@ def main() -> None:
             output_dir=output_dir,
             writer=client_writers[client.client_id],
             enable_eval=args.enable_eval,
+            use_weighted_sampler=args.use_weighted_sampler,
         )
 
     if args.enable_eval:
