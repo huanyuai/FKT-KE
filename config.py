@@ -32,7 +32,7 @@ TRAINING_DEFAULTS: Dict[str, Any] = {
     "num_train_epochs": 3,
     "logging_steps": 50,
     # Increase training budget for better convergence
-    "max_steps": 1000,
+    "max_steps": 100,
     "gradient_accumulation_steps": 4,
     "weight_decay": 0.01,
     "warmup_ratio": 0.1,
