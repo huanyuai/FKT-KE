@@ -8,9 +8,10 @@ from typing import List, Optional, Dict, Any, Tuple
 import torch
 import numpy as np
 from datasets import load_dataset, Dataset
-from transformers import AutoTokenizer, TrainingArguments, Trainer, DataCollatorWithPadding, TrainerCallback, AutoModelForCausalLM
+from transformers import AutoTokenizer, TrainingArguments, Trainer, DataCollatorWithPadding, TrainerCallback, AutoModelForCausalLM, AutoModelForSequenceClassification
 from peft import LoraConfig, TaskType, get_peft_model
 from datetime import datetime
+import multiprocessing as mp
 
 import config
 from client import Client
@@ -33,6 +34,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--alpha", type=float, default=config.NONIID_ALPHA, help="Dirichlet alpha for non-IID split")
     parser.add_argument("--enable_eval", action="store_true", help="Enable local eval and confidence logging")
     parser.add_argument("--use_weighted_sampler", action="store_true", help="Use class-balanced WeightedRandomSampler during training")
+    parser.add_argument("--parallel_warmup", action="store_true", help="Enable parallel LoRA warm-up across multiple GPUs")
+    parser.add_argument("--gpu_ids", type=str, default="", help="Comma-separated GPU ids for parallel warm-up, e.g., '0,1,2'")
     return parser.parse_args()
 
 
@@ -307,6 +310,61 @@ def _evaluate_client(client: Client, eval_ds: Dataset, writer: SummaryWriter, ro
     return float(acc)
 
 
+def _parse_gpu_ids(gpu_ids_str: str) -> List[int]:
+    if not gpu_ids_str:
+        return []
+    parts = [p.strip() for p in gpu_ids_str.split(",") if p.strip() != ""]
+    ids: List[int] = []
+    for p in parts:
+        try:
+            ids.append(int(p))
+        except ValueError:
+            continue
+    return ids
+
+
+def _warmup_worker(
+    client_id: int,
+    private_dataset: Dataset,
+    num_labels: int,
+    model_name: str,
+    run_dir: str,
+    enable_eval: bool,
+    use_weighted_sampler: bool,
+    gpu_id: int,
+) -> str:
+    # Each process sees only one GPU to avoid intra-process DP and NCCL
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+    client = Client(
+        client_id=client_id,
+        private_dataset=private_dataset,
+        device=device,
+        tokenizer=tokenizer,
+        num_labels=num_labels,
+    )
+
+    # Independent writer per client
+    writer = SummaryWriter(log_dir=os.path.join(run_dir, f"client_{client_id}"))
+    output_dir = os.path.join(run_dir, "outputs", f"client_{client_id}_lora")
+    os.makedirs(output_dir, exist_ok=True)
+
+    _finetune_client_with_lora(
+        client,
+        output_dir=output_dir,
+        writer=writer,
+        enable_eval=enable_eval,
+        use_weighted_sampler=use_weighted_sampler,
+    )
+
+    merged_dir = os.path.join(run_dir, "outputs", f"client_{client_id}_merged")
+    os.makedirs(merged_dir, exist_ok=True)
+    client.model.save_pretrained(merged_dir)
+    return merged_dir
+
+
 def main() -> None:
     args = _parse_args()
 
@@ -399,17 +457,47 @@ def main() -> None:
             num_labels=num_labels,
         ))
 
-    # Pre-FL per-client LoRA warm-up
-    for client in clients:
-        output_dir = os.path.join(run_dir, "outputs", f"client_{client.client_id}_lora")
-        os.makedirs(output_dir, exist_ok=True)
-        _finetune_client_with_lora(
-            client,
-            output_dir=output_dir,
-            writer=client_writers[client.client_id],
-            enable_eval=args.enable_eval,
-            use_weighted_sampler=args.use_weighted_sampler,
-        )
+    # Pre-FL LoRA warm-up (sequential or parallel)
+    if args.parallel_warmup and torch.cuda.is_available():
+        gpu_ids = _parse_gpu_ids(args.gpu_ids)
+        if len(gpu_ids) == 0:
+            gpu_ids = list(range(torch.cuda.device_count()))
+        if len(gpu_ids) == 0:
+            print("[Warn] No GPUs available for parallel warm-up; falling back to sequential.")
+        else:
+            print(f"[Info] Parallel warm-up on GPUs: {gpu_ids}")
+            with mp.get_context("spawn").Pool(processes=min(len(gpu_ids), args.num_clients)) as pool:
+                jobs = []
+                for client in clients:
+                    assigned_gpu = gpu_ids[client.client_id % len(gpu_ids)]
+                    jobs.append((
+                        client.client_id,
+                        client.private_data,
+                        client.num_labels,
+                        config.MODEL_NAME,
+                        run_dir,
+                        args.enable_eval,
+                        args.use_weighted_sampler,
+                        assigned_gpu,
+                    ))
+                merged_dirs: List[str] = pool.starmap(_warmup_worker, jobs)
+
+            # Load merged weights back into existing client objects
+            for client, mdir in zip(clients, merged_dirs):
+                model = AutoModelForSequenceClassification.from_pretrained(mdir)
+                client.model = model.to(device)
+
+    if not args.parallel_warmup or not torch.cuda.is_available():
+        for client in clients:
+            output_dir = os.path.join(run_dir, "outputs", f"client_{client.client_id}_lora")
+            os.makedirs(output_dir, exist_ok=True)
+            _finetune_client_with_lora(
+                client,
+                output_dir=output_dir,
+                writer=client_writers[client.client_id],
+                enable_eval=args.enable_eval,
+                use_weighted_sampler=args.use_weighted_sampler,
+            )
 
     if args.enable_eval:
         # Evaluate each client model on the shared public dataset (balanced/global view)
