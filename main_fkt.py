@@ -145,12 +145,12 @@ def _log_confidence_metrics(
 def _build_min_recipe_cfg(hidden: int = 768) -> RECIPEConfig:
     return RECIPEConfig(
         prompt_token_n=4,
-        edit_model_name="gpt2",
+        edit_model_name="bert",
         knowledge_rep_dim=256,
         knowl_rep_prot_token_n=1,
         model_hidden_size=hidden,
-        begin_layer_path="transformer.h.0.attn",
-        lm_head_path="lm_head",
+        begin_layer_path="",  # unused in FKTEditor
+        lm_head_path="",      # unused in FKTEditor
         training=RECIPEConfig.TrainingConfig(
             krm_lr=1e-4,
             pt_lr=1e-4,
@@ -164,15 +164,6 @@ def _build_min_recipe_cfg(hidden: int = 768) -> RECIPEConfig:
             edit_hinge_scale=1.0,
         ),
     )
-
-
-def _init_editor(device: torch.device) -> FKTEditor:
-    lm_tok = AutoTokenizer.from_pretrained("gpt2")
-    if lm_tok.pad_token_id is None:
-        lm_tok.pad_token = lm_tok.eos_token
-    lm = AutoModelForCausalLM.from_pretrained("gpt2").to(device)
-    cfg = _build_min_recipe_cfg(hidden=lm.config.n_embd)
-    return FKTEditor(model=lm, tokenizer=lm_tok, config=cfg, device=str(device), ckpt_path=None)
 
 
 def _finetune_client_with_lora(client: Client, output_dir: str, writer: SummaryWriter, enable_eval: bool, use_weighted_sampler: bool) -> None:
@@ -291,16 +282,34 @@ def _format_markdown_table(sample_texts: List[str], client_results: Dict[int, Li
 def _evaluate_client(client: Client, eval_ds: Dataset, writer: SummaryWriter, round_idx: int) -> float:
     client.model.eval()
     collator = DataCollatorWithPadding(tokenizer=client.tokenizer)
-    dl = DataLoader(eval_ds, batch_size=client.model.config.to_dict().get("per_device_eval_batch_size", 32), shuffle=False, collate_fn=collator)
+    batch_size = 32
+    if hasattr(client.model, 'config'):
+        cfg_dict = client.model.config.to_dict() if hasattr(client.model.config, 'to_dict') else {}
+        batch_size = int(cfg_dict.get('per_device_eval_batch_size', batch_size))
+    dl = DataLoader(eval_ds, batch_size=batch_size, shuffle=False, collate_fn=collator)
     correct = 0
     total = 0
     for batch in dl:
-        # Decode texts for activation (if editor provided)
+        # Decode texts for activation and prepend attention mask ones for prompts
         if getattr(client, 'editor', None) is not None:
             texts = client.tokenizer.batch_decode(batch["input_ids"], skip_special_tokens=True)
             prompts = client.editor.dynamic_activation(texts)
-            client.editor.adopted_prompts = [p.to(client.editor.device) for p in prompts]  # for hooked LMs
-        out = client.model(input_ids=batch["input_ids"].to(client.device), attention_mask=batch.get("attention_mask").to(client.device))
+            # ensure prompts on correct device
+            prompts = prompts.to(client.device)
+            client.editor.adopted_prompts = prompts
+            p_len = prompts.shape[1]
+            attn = batch.get("attention_mask")
+            if attn is None:
+                attn = torch.ones_like(batch["input_ids"])  # fallback
+            ones = torch.ones((attn.size(0), p_len), dtype=attn.dtype)
+            if attn.is_cuda:
+                ones = ones.to(attn.device)
+            attn = torch.cat([ones, attn], dim=1)
+            batch_attn = attn.to(client.device)
+        else:
+            batch_attn = batch.get("attention_mask").to(client.device)
+
+        out = client.model(input_ids=batch["input_ids"].to(client.device), attention_mask=batch_attn)
         preds = out.logits.argmax(dim=-1).cpu()
         labels = batch["labels"].cpu()
         correct += int((preds == labels).sum().item())
@@ -561,7 +570,10 @@ def main() -> None:
     # Initialize editors for clients
     editors: List[FKTEditor] = []
     for c in clients:
-        ed = _init_editor(device)
+        # Bind editor to the client's classifier model
+        hidden = c.model.config.hidden_size if hasattr(c.model.config, 'hidden_size') else c.model.config.to_dict().get('hidden_size', 768)
+        cfg_editor = _build_min_recipe_cfg(hidden=hidden)
+        ed = FKTEditor(client_model=c.model, config=cfg_editor, device=str(device))
         c.editor = ed
         editors.append(ed)
 
