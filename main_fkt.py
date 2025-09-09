@@ -333,9 +333,15 @@ def _warmup_worker(
     use_weighted_sampler: bool,
     gpu_id: int,
 ) -> str:
-    # Each process sees only one GPU to avoid intra-process DP and NCCL
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Bind the process to a specific CUDA device without changing environment
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.set_device(gpu_id)
+        except Exception:
+            pass
+        device = torch.device(f"cuda:{gpu_id}")
+    else:
+        device = torch.device("cpu")
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
     client = Client(
